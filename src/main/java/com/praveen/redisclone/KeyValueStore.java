@@ -1,90 +1,75 @@
 package com.praveen.redisclone;
 
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * The actual data engine. Phase 1 supports strings only (lists/hashes/sets
  * come in a later phase).
  *
- * DESIGN NOTE: real Redis is single-threaded, so it never needs locks around
- * its data structures at all -- that's WHY it's so fast. We're using an NIO
- * single-threaded event loop too (see RedisServer), so this store is only
- * ever touched by one thread. We still use ConcurrentHashMap + a lock here
- * defensively, and to leave the door open for a multi-threaded worker pool
- * later if you want to experiment with that tradeoff yourself.
+ * LOCKING: a single ConcurrentHashMap<String, Entry> holds both the value
+ * and its TTL per key, updated via compute()/computeIfPresent(). Those
+ * methods hold ConcurrentHashMap's own per-bucket lock for the duration of
+ * the remapping function, so "read the current entry, decide the new one,
+ * write it back" is atomic per key -- with no external lock:
+ *   - In --mode=epoll, only the single reactor thread ever calls in here, so
+ *     there was never a race to prevent. The ReentrantReadWriteLock this
+ *     replaced was pure overhead paid on every single command for zero
+ *     correctness benefit.
+ *   - In --mode=thread, that lock was one GLOBAL lock shared by every key --
+ *     unrelated keys (e.g. SET user:1 from one client, SET user:2 from
+ *     another) fully serialized behind each other even though nothing about
+ *     them conflicts. Per-key atomicity via compute() lets unrelated keys
+ *     proceed truly in parallel, using ConcurrentHashMap's existing
+ *     per-bucket locking -- strictly better concurrency, not just a smaller
+ *     lock.
+ * This also halves the map operations per command: SET/GET/DEL/EXPIRE used
+ * to each touch two separate maps (value + TTL); now they touch one.
  *
- * TTL/expiry: each key can have an optional expiry timestamp (epoch millis).
- * We do LAZY expiry (checked on read) here; Phase 2 will add ACTIVE expiry
- * (a background sweep), which is what real Redis does in addition to lazy
+ * TTL/expiry: each entry carries its own expiry timestamp (0 = none). We do
+ * LAZY expiry (checked on read) here; Phase 2 will add ACTIVE expiry (a
+ * background sweep), which is what real Redis does in addition to lazy
  * expiry.
  */
 public class KeyValueStore {
 
-    private final ConcurrentHashMap<String, String> data = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, Long> expiryTimestamps = new ConcurrentHashMap<>();
-    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+    private record Entry(String value, long expiryAtMillis) {
+        boolean isExpired() {
+            return expiryAtMillis != 0 && System.currentTimeMillis() >= expiryAtMillis;
+        }
+    }
+
+    private final ConcurrentHashMap<String, Entry> data = new ConcurrentHashMap<>();
 
     public void set(String key, String value) {
-        lock.writeLock().lock();
-        try {
-            data.put(key, value);
-            expiryTimestamps.remove(key); // SET clears any previous TTL, like real Redis
-        } finally {
-            lock.writeLock().unlock();
-        }
+        // A plain put() replaces any previous entry -- including whatever
+        // TTL it carried -- in one map write, matching real Redis's "SET
+        // clears any previous TTL" behavior without a separate TTL-map remove.
+        data.put(key, new Entry(value, 0));
     }
 
     public String get(String key) {
-        lock.readLock().lock();
-        try {
-            if (isExpired(key)) return null;
-            return data.get(key);
-        } finally {
-            lock.readLock().unlock();
-        }
+        // computeIfPresent runs under the same per-key bin lock as any
+        // concurrent SET/EXPIRE on this exact key, so "check expiry, evict if
+        // stale" can't race with another thread's update to the same key --
+        // returning null from the remapping function atomically removes the
+        // mapping.
+        Entry entry = data.computeIfPresent(key, (k, e) -> e.isExpired() ? null : e);
+        return entry == null ? null : entry.value();
     }
 
     public boolean del(String key) {
-        lock.writeLock().lock();
-        try {
-            expiryTimestamps.remove(key);
-            return data.remove(key) != null;
-        } finally {
-            lock.writeLock().unlock();
-        }
+        return data.remove(key) != null;
     }
 
     public boolean exists(String key) {
-        lock.readLock().lock();
-        try {
-            if (isExpired(key)) return false;
-            return data.containsKey(key);
-        } finally {
-            lock.readLock().unlock();
-        }
+        return get(key) != null;
     }
 
     public void expire(String key, long seconds) {
-        lock.writeLock().lock();
-        try {
-            if (data.containsKey(key)) {
-                expiryTimestamps.put(key, System.currentTimeMillis() + seconds * 1000);
-            }
-        } finally {
-            lock.writeLock().unlock();
-        }
-    }
-
-    /** Lazy expiry: if a key's TTL has passed, evict it right now, on this read. */
-    private boolean isExpired(String key) {
-        Long expiry = expiryTimestamps.get(key);
-        if (expiry == null) return false;
-        if (System.currentTimeMillis() >= expiry) {
-            data.remove(key);
-            expiryTimestamps.remove(key);
-            return true;
-        }
-        return false;
+        // No-op if the key is absent (computeIfPresent skips the function
+        // entirely), matching the original "only set a TTL if the key
+        // exists" behavior.
+        data.computeIfPresent(key, (k, e) ->
+                new Entry(e.value(), System.currentTimeMillis() + seconds * 1000));
     }
 }

@@ -48,6 +48,15 @@ public class CommandDispatcher {
         }
 
         List<String> args = parts.subList(1, parts.size());
-        return command.execute(args, store);
+        try {
+            return command.execute(args, store);
+        } catch (RuntimeException badArguments) {
+            // A command's own argument parsing (e.g. Long.parseLong in
+            // EXPIRE/SLOWCOMPUTE) can throw on malformed input. Without this,
+            // the exception propagates out of dispatch() uncaught -- in
+            // --mode=thread that silently kills the client's handler thread
+            // instead of the client getting an error reply back.
+            return RespWriter.error("invalid arguments for '" + commandName + "': " + badArguments.getMessage());
+        }
     }
 }
